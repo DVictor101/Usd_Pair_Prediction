@@ -1,4 +1,3 @@
-
 import json
 import time
 import random
@@ -84,7 +83,7 @@ def scrape_year_html(year, delay=4.0):
     for i, code in enumerate(codes, 1):
         print(f"[{i}/{len(codes)}] Fetching week {code}...")
         try:
-            events = scrape_week_html(week_code=code, delay=delay)
+            events = scrape_week_html(week_code=code, delay=delay, year=year)
             all_events.extend(events)
         except Exception as e:
             print(f"  Failed on week {code}: {e}")
@@ -94,14 +93,51 @@ def scrape_year_html(year, delay=4.0):
     return all_events
 
 
-def scrape_week_html(week_code=None, delay=3.0):
+CURRENCIES_WANTED = {"USD", "JPY"}
+
+
+def _parse_full_date(raw_date_text, fallback_year):
+    """
+    Forex Factory's date cell usually reads like 'Mon Jan 1' with no year.
+    Combine it with the year of the week being scraped to get a full date.
+    Returns (day, month, year, iso_date_string) — falls back to raw text
+    fields as None if parsing fails.
+    """
+    if not raw_date_text:
+        return None, None, None, None
+
+    # Strip weekday prefix (e.g. "Mon", "Tue") if present
+    parts = raw_date_text.split()
+    parts = [p for p in parts if p.lower() not in
+             ("mon", "tue", "wed", "thu", "fri", "sat", "sun")]
+    cleaned = " ".join(parts)
+
+    for fmt in ("%b %d", "%B %d"):
+        try:
+            dt = datetime.strptime(cleaned, fmt)
+            dt = dt.replace(year=fallback_year)
+            return dt.day, dt.strftime("%B"), dt.year, dt.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+
+    # Couldn't parse — return raw text so nothing is silently lost
+    return None, None, fallback_year, raw_date_text
+
+
+def scrape_week_html(week_code=None, delay=3.0, year=None,
+                      currencies=CURRENCIES_WANTED):
     """
     Scrape a calendar page from HTML.
 
-    week_code: e.g. "jan7.2024" for a specific week, or None for
-               the current week. Forex Factory URLs look like:
-               https://www.forexfactory.com/calendar?week=jan7.2024
-    delay:     seconds to sleep before the request (be polite).
+    week_code:  e.g. "jan7.2024" for a specific week, or None for
+                the current week. Forex Factory URLs look like:
+                https://www.forexfactory.com/calendar?week=jan7.2024
+    delay:      seconds to sleep before the request (be polite).
+    year:       year to attach to parsed dates (the date cells on the
+                page don't include a year). Defaults to current year
+                if not given.
+    currencies: set of currency codes to keep (e.g. {"USD", "JPY"}).
+                Pass None to keep all currencies.
     """
     time.sleep(delay + random.uniform(0, 1.5))
 
@@ -120,12 +156,14 @@ def scrape_week_html(week_code=None, delay=3.0):
     soup = BeautifulSoup(resp.text, "html.parser")
     rows = soup.select("tr.calendar__row")
 
+    fallback_year = year or datetime.now().year
+
     events = []
-    current_date = None
+    current_raw_date = None
     for row in rows:
         date_cell = row.select_one(".calendar__date")
         if date_cell and date_cell.get_text(strip=True):
-            current_date = date_cell.get_text(strip=True)
+            current_raw_date = date_cell.get_text(strip=True)
 
         time_cell = row.select_one(".calendar__time")
         currency_cell = row.select_one(".calendar__currency")
@@ -138,10 +176,19 @@ def scrape_week_html(week_code=None, delay=3.0):
         if not event_cell:
             continue
 
+        currency = currency_cell.get_text(strip=True) if currency_cell else None
+        if currencies and currency not in currencies:
+            continue
+
+        day, month, yr, full_date = _parse_full_date(current_raw_date, fallback_year)
+
         events.append({
-            "date": current_date,
+            "day": day,
+            "month": month,
+            "year": yr,
+            "date": full_date,
             "time": time_cell.get_text(strip=True) if time_cell else None,
-            "currency": currency_cell.get_text(strip=True) if currency_cell else None,
+            "currency": currency,
             "impact": impact_cell.get("title") if impact_cell else None,
             "event": event_cell.get_text(strip=True),
             "actual": actual_cell.get_text(strip=True) if actual_cell else None,
@@ -187,19 +234,35 @@ def main():
 
     if args.mode == "json":
         data = fetch_this_week_json()
-        # Normalize field names slightly for consistency with html mode
-        events = [{
-            "date": e.get("date"),
-            "time": e.get("date"),  # JSON export embeds full datetime in 'date'
-            "currency": e.get("country"),
-            "impact": e.get("impact"),
-            "event": e.get("title"),
-            "actual": e.get("actual"),
-            "forecast": e.get("forecast"),
-            "previous": e.get("previous"),
-        } for e in data]
+        events = []
+        for e in data:
+            currency = e.get("country")
+            if currency not in CURRENCIES_WANTED:
+                continue
+            raw_dt = e.get("date")  # ISO-ish datetime string from the export
+            day = month = yr = full_date = None
+            if raw_dt:
+                try:
+                    dt = datetime.fromisoformat(raw_dt.replace("Z", "+00:00"))
+                    day, month, yr = dt.day, dt.strftime("%B"), dt.year
+                    full_date = dt.strftime("%Y-%m-%d")
+                except ValueError:
+                    full_date = raw_dt
+            events.append({
+                "day": day,
+                "month": month,
+                "year": yr,
+                "date": full_date,
+                "time": raw_dt,
+                "currency": currency,
+                "impact": e.get("impact"),
+                "event": e.get("title"),
+                "actual": e.get("actual"),
+                "forecast": e.get("forecast"),
+                "previous": e.get("previous"),
+            })
     else:
-        events = scrape_week_html(week_code=args.week, delay=args.delay)
+        events = scrape_week_html(week_code=args.week, delay=args.delay, year=args.year)
 
     save_csv(events, args.out)
 
